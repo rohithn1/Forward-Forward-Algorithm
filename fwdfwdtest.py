@@ -1,3 +1,4 @@
+import pickle
 import math
 import torch
 import torch.nn as nn
@@ -90,8 +91,8 @@ class FwdFwdModel(torch.nn.Module):
             z = z.detach()  # Detach to ensure no computation graph reuse
             z.requires_grad_()
             z = layer(z)
-            neural_sample.append(z)
             z = self.act_fn(z) # forward through layer
+            neural_sample.append(z)
             ff_loss = self._calc_ff_loss(z, ff_labels) # calc layer wise loss
             self.optimizers[optim_idx].zero_grad()
 
@@ -104,12 +105,26 @@ class FwdFwdModel(torch.nn.Module):
 
 
         #scalar_outputs[f"loss_layer_{idx}"] = ff_loss
-
-        return self._linear_classifier_fwd(neural_sample, class_labels)
+        if ff_labels:
+            return self._linear_classifier_fwd(neural_sample, class_labels)
+        return None, None
     
     def get_linear_classifier_param(self):
         return self.linear_classifer.parameters()
     
+    def infer(self, inputs):
+        z = inputs
+        neural_sample = []
+        with torch.no_grad():
+            for idx, layer in enumerate(self.model):
+                z = layer(z)
+                z = self.act_fn(z)
+                z = self._layer_norm(z)
+                neural_sample.append(z)
+            lr_input = neural_sample[0]
+            for i in range(1, len(neural_sample)):
+                lr_input = torch.cat((neural_sample, neural_sample[i]), 0)
+            return self.linear_classifer(lr_input)
 
 def preprocess_sample(inputs, labels): 
     # TODO (this will break when batch size is greater than 1)
@@ -138,7 +153,7 @@ def train(epochs, model, optimizer, train_loader): # this optimizer and loss is 
             optimizer.zero_grad()
 
             # negative data forward
-            optimizer.zero_grad() 
+            # optimizer.zero_grad() 
             
             # making the output of the model 1 hot encoding
             max_idx = torch.argmax(output)
@@ -150,10 +165,10 @@ def train(epochs, model, optimizer, train_loader): # this optimizer and loss is 
             epoch_accuracy += is_accurate(one_hot_label, output)
 
             loss, output = model(preprocess_sample(inputs, max_idx + 1), torch.tensor(0.0), output.detach().requires_grad_())
-            loss.backward() # TODO (should we do the linear regressor step for negative data?)
+            # loss.backward() # TODO (should we do the linear regressor step for negative data?)
 
-            optimizer.step()
-            optimizer.zero_grad()
+            # optimizer.step()
+            # optimizer.zero_grad()
 
             # # making the output of the model 1 hot encoding
             # max_idx = torch.argmax(output)
@@ -215,8 +230,11 @@ for image, label in train_loader:
     break
 
 
-layers = [794, 2000, 2000, 2000, 2000]
+layers = [794, 2000, 2000, 2000]
 model = FwdFwdModel(layers)
 optimizer = torch.optim.Adam(model.get_linear_classifier_param())
 
-train(10, model, optimizer, train_loader)
+trained_model = train(2, model, optimizer, train_loader)
+
+with open("model.pkl", "wb") as file:
+    pickle.dump(trained_model, file)
