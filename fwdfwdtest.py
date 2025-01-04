@@ -53,12 +53,12 @@ class FwdFwdModel(torch.nn.Module):
         logits = sum_of_squares - z.shape[0] # TODO (not sure if authors used size of layer as threshold)
         logits = torch.sigmoid(logits)
         ff_loss = self.ff_loss(logits, labels)
-        
+
         return ff_loss
-    
+
     def _layer_norm(self, z, eps=1e-8):
         return z / (torch.sqrt(torch.mean(z ** 2, dim=-1, keepdim=True)) + eps)
-    
+
     def _linear_classifier_fwd(self, input, label):
         # append all weight tensors into single tensor
         neural_sample = input[0]
@@ -73,9 +73,9 @@ class FwdFwdModel(torch.nn.Module):
         # loss
         classification_loss = self.classification_loss(output, label)
 
-        # return 
+        # return
         return classification_loss, output
-    
+
     def forward(self, inputs, ff_labels, class_labels):
         # scalar_outputs = {
         #     "Loss": torch.zeros(1, device="cpu")
@@ -108,10 +108,10 @@ class FwdFwdModel(torch.nn.Module):
         if ff_labels:
             return self._linear_classifier_fwd(neural_sample, class_labels)
         return None, None
-    
+
     def get_linear_classifier_param(self):
         return self.linear_classifer.parameters()
-    
+
     def infer(self, inputs):
         z = inputs
         neural_sample = []
@@ -123,38 +123,39 @@ class FwdFwdModel(torch.nn.Module):
                 neural_sample.append(z)
             lr_input = neural_sample[0]
             for i in range(1, len(neural_sample)):
-                lr_input = torch.cat((neural_sample, neural_sample[i]), 0)
-            return self.linear_classifer(lr_input)
+                lr_input = torch.cat((lr_input, neural_sample[i]), 0)
+            output = self.linear_classifer(lr_input)
+            return output - torch.max(output, dim=-1, keepdim=True)[0]
 
-def preprocess_sample(inputs, labels): 
+def preprocess_sample(inputs, labels):
     # TODO (this will break when batch size is greater than 1)
     one_hot_label = torch.zeros([10])
     one_hot_label[labels - 1] = 1
     # concatinate the label as a 1 hot encoding and flattened image
-    return torch.cat((one_hot_label, torch.flatten(inputs)))
+    return torch.cat((one_hot_label, torch.flatten(inputs))).to("cuda")
 
 def train(epochs, model, optimizer, train_loader): # this optimizer and loss is for the linear classifier
-    
+
     for epoch in range(epochs):
         epoch_accuracy = 0
         sample_counter = 0 # for now ill include negative samples in this too
         for inputs, labels, in train_loader:
 
             # positive data forward
-            optimizer.zero_grad() 
+            optimizer.zero_grad()
 
             # making the label 1 hot encoding
             one_hot_label = torch.zeros([10])
             one_hot_label[labels - 1] = 1
-            loss, output = model(preprocess_sample(inputs, labels), torch.tensor(1.0), one_hot_label)
+            loss, output = model(preprocess_sample(inputs, labels), torch.tensor(1.0).to("cuda"), one_hot_label.to("cuda"))
             loss.backward()
 
             optimizer.step()
             optimizer.zero_grad()
 
             # negative data forward
-            # optimizer.zero_grad() 
-            
+            # optimizer.zero_grad()
+
             # making the output of the model 1 hot encoding
             max_idx = torch.argmax(output)
             output = torch.zeros_like(output)
@@ -164,7 +165,7 @@ def train(epochs, model, optimizer, train_loader): # this optimizer and loss is 
             sample_counter += 1
             epoch_accuracy += is_accurate(one_hot_label, output)
 
-            loss, output = model(preprocess_sample(inputs, max_idx + 1), torch.tensor(0.0), output.detach().requires_grad_())
+            loss, output = model(preprocess_sample(inputs, max_idx + 1), torch.tensor(0.0).to("cuda"), output.detach().requires_grad_().to("cuda"))
             # loss.backward() # TODO (should we do the linear regressor step for negative data?)
 
             # optimizer.step()
@@ -178,9 +179,30 @@ def train(epochs, model, optimizer, train_loader): # this optimizer and loss is 
             # # update accuracy calcs after positive data step
             # sample_counter += 1
             # epoch_accuracy += is_accurate(label, output)
-            print(f"Epoch: {epoch} -- Sample: {sample_counter}/{len(train_loader.dataset)} -- {epoch_accuracy}/{sample_counter}({round(epoch_accuracy/sample_counter*100, 2)}%)") # just doing this for positive samples for now
-
+            if sample_counter % 1000 == 0:
+              print(f"Epoch: {epoch} -- Sample: {sample_counter}/{len(train_loader.dataset)} -- Accuracy rate: {epoch_accuracy}/{sample_counter}({round(epoch_accuracy/sample_counter*100, 2)}%)") # just doing this for positive samples for now
+        test(model)
     return model
+
+def preprocess_sample_test(inputs): 
+    # TODO (this will break when batch size is greater than 1)
+    one_hot_label = torch.zeros([10])
+    # concatinate the label as a 1 hot encoding and flattened image
+    return torch.cat((one_hot_label, torch.flatten(inputs))).to("cuda")
+
+def test(model):
+    wrong = 0
+    i = 0
+    total = len(test_loader.dataset)
+    for inputs, labels, in test_loader:
+        i += 1
+        truth = labels.item()
+        prediction = model.infer(preprocess_sample_test(inputs)).argmax() + 1
+        if truth != prediction:
+            #print_sample(inputs[0])
+            wrong += 1
+    print(f"Error rate: {wrong} / {i} ({round(wrong/i*100, 2)}%)")
+    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
 def is_accurate(label, output):
     if torch.argmax(label) == torch.argmax(output):
@@ -213,7 +235,7 @@ test_dataset = datasets.FashionMNIST(
 train_loader = torch.utils.data.DataLoader(
     dataset=train_dataset,
     batch_size=1,  # Number of samples per batch
-    shuffle=False  # Shuffle the dataset
+    shuffle=True  # Shuffle the dataset
 )
 
 test_loader = torch.utils.data.DataLoader(
@@ -230,11 +252,12 @@ for image, label in train_loader:
     break
 
 
-layers = [794, 2000, 2000, 2000]
+layers = [794, 2000, 2000, 2000, 2000]
 model = FwdFwdModel(layers)
+model = model.to("cuda")
 optimizer = torch.optim.Adam(model.get_linear_classifier_param())
 
-trained_model = train(2, model, optimizer, train_loader)
+trained_model = train(30, model, optimizer, train_loader)
 
 with open("model.pkl", "wb") as file:
     pickle.dump(trained_model, file)
