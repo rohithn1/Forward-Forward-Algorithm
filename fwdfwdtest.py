@@ -1,4 +1,5 @@
 import pickle
+import random
 import math
 import torch
 import torch.nn as nn
@@ -72,12 +73,12 @@ class FwdFwdModel(torch.nn.Module):
         # forward pass through classifier
         output = self.linear_classifer(neural_sample.detach())
         output = output - torch.max(output, dim=-1, keepdim=True)[0] # TODO (not entirely clear what this is for)
-
+        
         # loss
         classification_loss = self.classification_loss(output, label*1.0)
 
         # return
-        return classification_loss, torch.argmax(output, dim=-1)
+        return classification_loss, output
 
     def forward(self, inputs, ff_labels, class_labels):
         # scalar_outputs = {
@@ -127,16 +128,29 @@ class FwdFwdModel(torch.nn.Module):
             for i in range(1, len(neural_sample)):
                 lr_input = torch.cat((lr_input, neural_sample[i]), -1)
             output = self.linear_classifer(lr_input)
-            return output - torch.max(output, dim=-1, keepdim=True)[0]
+            output = output - torch.max(output, dim=-1, keepdim=True)[0]
+            return output
 
 def preprocess_sample(inputs, labels):
+    inputs = inputs.to(device)
+    labels = labels.to(device)
     if labels[0].shape != torch.Size([10]):
         one_hot_labels = F.one_hot(labels, num_classes=10)
     else:
         one_hot_labels = labels
     inputs = torch.reshape(inputs, (len(inputs), 784))
     # concatinate the label as a 1 hot encoding and flattened image
-    return torch.cat((one_hot_labels, inputs), -1).to(device), one_hot_labels.to(device)
+    return torch.cat((one_hot_labels, inputs), -1), one_hot_labels * 1.0
+
+def create_negative_label(labels):
+    labels = labels.detach().clone()
+    labels = labels.to(device)
+    for i in range(len(labels)):
+        neg_label = random.randint(0, 9)
+        while neg_label == labels[i].item():
+            neg_label = random.randint(0, 9)
+        labels[i] = neg_label
+    return labels
 
 def train(epochs, model, optimizer, train_loader): # this optimizer and loss is for the linear classifier
 
@@ -145,27 +159,29 @@ def train(epochs, model, optimizer, train_loader): # this optimizer and loss is 
         sample_counter = 0 # for now ill include negative samples in this too
         for inputs, labels, in train_loader:
 
-            # positive data forward
+            # positive data forward ~~~~~~~~~~
             optimizer.zero_grad()
 
             # making the label 1 hot encoding
             label_and_input, one_hot_labels = preprocess_sample(inputs, labels)
             ff_labels = torch.ones(len(inputs), 1).to(device)
-            loss, output = model(label_and_input, ff_labels, one_hot_labels) # TODO (not sure if using model output -> neg data pipeline is a good idea anymore)
+            loss, output = model(label_and_input, ff_labels, one_hot_labels) 
             loss.backward()
 
             optimizer.step()
             optimizer.zero_grad()
 
-            # negative data forward
+            # negative data forward ~~~~~~~~~~
+            # TODO (Note: pretty sure using model output -> neg data pipeline is a good idea anymore)
             # optimizer.zero_grad()
 
             # update accuracy calcs after positive data step
             sample_counter += len(inputs)
             epoch_accuracy += absolute_loss(torch.argmax(one_hot_labels, -1), output)
-            label_and_input, one_hot_labels = preprocess_sample(inputs, output)
+
+            negative_labels = create_negative_label(labels) # shuffles around labels
+            label_and_input, one_hot_labels = preprocess_sample(inputs, negative_labels)
             ff_labels = torch.zeros(len(inputs), 1).to(device)
-            breakpoint()
             loss, output = model(label_and_input, ff_labels, one_hot_labels.detach().requires_grad_())
             # loss.backward() # TODO (should we do the linear regressor step for negative data?)
 
@@ -180,8 +196,7 @@ def train(epochs, model, optimizer, train_loader): # this optimizer and loss is 
             # # update accuracy calcs after positive data step
             # sample_counter += 1
             # epoch_accuracy += is_accurate(label, output)
-            if sample_counter % 1000 == 0:
-                print(f"Epoch: {epoch} -- Sample: {sample_counter}/{len(train_loader.dataset)} -- Accuracy rate: {epoch_accuracy}/{sample_counter}({round(epoch_accuracy/sample_counter*100, 2)}%)") # just doing this for positive samples for now
+        print(f"Epoch: {epoch} -- Sample: {sample_counter}/{len(train_loader.dataset)} -- Error rate: {epoch_accuracy}/{sample_counter}({round(epoch_accuracy/sample_counter*100, 2)}%)") # just doing this for positive samples for now
         test(model)
     return model
 
@@ -198,6 +213,12 @@ def test(model):
     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
 def absolute_loss(label, output):
+    label = label.to(device)
+    output = output.to(device)
+    if output[0].shape == torch.Size([10]):
+        output = torch.argmax(output, -1)
+    if label[0].shape == torch.Size([10]):
+        label = torch.argmax(label, -1)
     return torch.count_nonzero(label - output, -1).item()
 
 
@@ -235,14 +256,6 @@ test_loader = torch.utils.data.DataLoader(
     batch_size=128,
     shuffle=False  # No need to shuffle the test set
 )
-
-# Example: Iterate through the training DataLoader
-for image, label in train_loader:
-    image = image.squeeze(0)  # Remove the batch dimension, making it [1, 28, 28]
-    #label = label.item()  # Convert the label tensor to a Python integer
-    print(f"Image shape: {image.shape}, Label: {label.shape}")
-    break
-
 
 layers = [794, 2000, 2000, 2000, 2000]
 model = FwdFwdModel(layers)
