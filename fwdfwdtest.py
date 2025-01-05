@@ -58,7 +58,7 @@ class FwdFwdModel(torch.nn.Module):
         logits = torch.reshape(torch.sigmoid(logits), (len(z), 1))
         ff_loss = self.ff_loss(logits, labels)
 
-        return ff_loss
+        return ff_loss, sum_of_squares
 
     def _layer_norm(self, z, eps=1e-8):
         return z / (torch.sqrt(torch.mean(z ** 2, dim=-1, keepdim=True)) + eps)
@@ -96,7 +96,7 @@ class FwdFwdModel(torch.nn.Module):
             z = layer(z)
             z = self.act_fn(z) # forward through layer
             neural_sample.append(z)
-            ff_loss = self._calc_ff_loss(z, ff_labels) # calc layer wise loss
+            ff_loss, _ = self._calc_ff_loss(z, ff_labels) # calc layer wise loss
             self.optimizers[optim_idx].zero_grad()
 
             ff_loss.backward(retain_graph=True) # compute gradients for layer
@@ -130,6 +130,26 @@ class FwdFwdModel(torch.nn.Module):
             output = self.linear_classifer(lr_input)
             output = output - torch.max(output, dim=-1, keepdim=True)[0]
             return output
+
+    def get_goodness(self, inputs):
+        with torch.no_grad():
+            sum_of_squares = torch.zeros(len(inputs)).to(device)
+            z = inputs
+            for idx, layer in enumerate(self.model):
+                z = layer(z)
+                z = self.act_fn(z)
+                z = self._layer_norm(z)
+                sum_of_squares += torch.sum(z ** 2, dim=-1)
+        return sum_of_squares.reshape((len(inputs), 1))
+
+    def slower_inference(self, inputs):
+        predictions = torch.full((len(inputs), 1), float('-inf')).to(device)
+        for i in range(0, 10):
+            labels = F.one_hot((torch.ones((len(inputs))) * i).to(torch.int64), num_classes=10)
+            label_and_input, _ = preprocess_sample(inputs, labels)
+            prediction = self.get_goodness(label_and_input)
+            predictions = torch.cat((predictions, prediction), -1)
+        return torch.argmax(predictions, -1)
 
 def preprocess_sample(inputs, labels):
     inputs = inputs.to(device)
@@ -208,17 +228,29 @@ def test(model):
         i += len(inputs)
         label_and_input, _ = preprocess_sample(inputs, torch.zeros(len(inputs), 10).to(device))
         prediction = model.infer(label_and_input)
-        wrong += absolute_loss(labels, prediction)
-    print(f"Error rate: {wrong} / {i} ({round(wrong/i*100, 2)}%)")
-    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        #prediction = model.slower_inference(inputs)
+        wrong += absolute_loss(labels, prediction, True)
 
-def absolute_loss(label, output):
+    print(f"Error rate: {wrong} / {i} ({round(wrong/i*100, 2)}%)")
+    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+
+def absolute_loss(label, output, verbose=False):
     label = label.to(device)
     output = output.to(device)
     if output[0].shape == torch.Size([10]):
         output = torch.argmax(output, -1)
     if label[0].shape == torch.Size([10]):
         label = torch.argmax(label, -1)
+
+    if verbose:
+        diff_mask = label != output
+        label_diff_values = label[diff_mask]
+        output_diff_values = output[diff_mask]
+        print("------------------------------Diffs----------------------------------")
+        print(f"Label value: {label_diff_values.tolist()}")
+        print(f"  Out value: {output_diff_values.tolist()}")
+        
     return torch.count_nonzero(label - output, -1).item()
 
 
@@ -229,7 +261,7 @@ transform = transforms.Compose([
 ])
 
 print("Downloading the training dataset to ./data")
-train_dataset = datasets.FashionMNIST(
+train_dataset = datasets.MNIST(
     root='./data',  # Directory to store the dataset
     train=True,  # Load the training set
     download=True,  # Download the dataset if not available locally
@@ -237,7 +269,7 @@ train_dataset = datasets.FashionMNIST(
 )
 
 print("Downloading the testing dataset to ./data")
-test_dataset = datasets.FashionMNIST(
+test_dataset = datasets.MNIST(
     root='./data',
     train=False,  # Load the test set
     download=True,
@@ -257,10 +289,10 @@ test_loader = torch.utils.data.DataLoader(
     shuffle=False  # No need to shuffle the test set
 )
 
-layers = [794, 2000, 2000, 2000, 2000]
+layers = [794, 2000, 2000, 2000, 2000] # TODO (mess with these values too)
 model = FwdFwdModel(layers)
 model = model.to(device)
-optimizer = torch.optim.Adam(model.get_linear_classifier_param())
+optimizer = torch.optim.Adam(model.get_linear_classifier_param(), lr=0.0001, weight_decay=0.001)
 
 trained_model = train(30, model, optimizer, train_loader)
 
