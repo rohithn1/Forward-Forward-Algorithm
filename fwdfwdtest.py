@@ -2,7 +2,10 @@ import pickle
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import datasets, transforms
+
+device = "cuda"
 
 class ReLU_full_grad(torch.autograd.Function):
     """ ReLU activation function that passes through the gradient irrespective of its input value. """
@@ -50,8 +53,8 @@ class FwdFwdModel(torch.nn.Module):
 
     def _calc_ff_loss(self, z, labels):
         sum_of_squares = torch.sum(z ** 2, dim=-1)
-        logits = sum_of_squares - z.shape[0] # TODO (not sure if authors used size of layer as threshold)
-        logits = torch.sigmoid(logits)
+        logits = sum_of_squares - z.shape[-1] # TODO (not sure if authors used size of layer as threshold)
+        logits = torch.reshape(torch.sigmoid(logits), (len(z), 1))
         ff_loss = self.ff_loss(logits, labels)
 
         return ff_loss
@@ -64,24 +67,23 @@ class FwdFwdModel(torch.nn.Module):
         neural_sample = input[0]
         for i in range(1, len(input)):
             # TODO (line below might break when batch size > 1)
-            neural_sample = torch.cat((neural_sample, input[i]), 0)
+            neural_sample = torch.cat((neural_sample, input[i]), -1)
 
         # forward pass through classifier
         output = self.linear_classifer(neural_sample.detach())
-        output = output - torch.max(output, dim=-1, keepdim=True)[0] # TODO (not entirely clear why each entry in output is made 0 or -ve)
+        output = output - torch.max(output, dim=-1, keepdim=True)[0] # TODO (not entirely clear what this is for)
 
         # loss
-        classification_loss = self.classification_loss(output, label)
+        classification_loss = self.classification_loss(output, label*1.0)
 
         # return
-        return classification_loss, output
+        return classification_loss, torch.argmax(output, dim=-1)
 
     def forward(self, inputs, ff_labels, class_labels):
         # scalar_outputs = {
         #     "Loss": torch.zeros(1, device="cpu")
         # }
 
-        # breakpoint()
 
         z = inputs
 
@@ -104,8 +106,8 @@ class FwdFwdModel(torch.nn.Module):
             z = self._layer_norm(z) # normalize for next layer
 
 
-        #scalar_outputs[f"loss_layer_{idx}"] = ff_loss
-        if ff_labels:
+        # only do the fwd pass on linear classifier if the data is positive
+        if ff_labels[0]:
             return self._linear_classifier_fwd(neural_sample, class_labels)
         return None, None
 
@@ -123,16 +125,18 @@ class FwdFwdModel(torch.nn.Module):
                 neural_sample.append(z)
             lr_input = neural_sample[0]
             for i in range(1, len(neural_sample)):
-                lr_input = torch.cat((lr_input, neural_sample[i]), 0)
+                lr_input = torch.cat((lr_input, neural_sample[i]), -1)
             output = self.linear_classifer(lr_input)
             return output - torch.max(output, dim=-1, keepdim=True)[0]
 
 def preprocess_sample(inputs, labels):
-    # TODO (this will break when batch size is greater than 1)
-    one_hot_label = torch.zeros([10])
-    one_hot_label[labels - 1] = 1
+    if labels[0].shape != torch.Size([10]):
+        one_hot_labels = F.one_hot(labels, num_classes=10)
+    else:
+        one_hot_labels = labels
+    inputs = torch.reshape(inputs, (len(inputs), 784))
     # concatinate the label as a 1 hot encoding and flattened image
-    return torch.cat((one_hot_label, torch.flatten(inputs))).to("cuda")
+    return torch.cat((one_hot_labels, inputs), -1).to(device), one_hot_labels.to(device)
 
 def train(epochs, model, optimizer, train_loader): # this optimizer and loss is for the linear classifier
 
@@ -145,9 +149,9 @@ def train(epochs, model, optimizer, train_loader): # this optimizer and loss is 
             optimizer.zero_grad()
 
             # making the label 1 hot encoding
-            one_hot_label = torch.zeros([10])
-            one_hot_label[labels - 1] = 1
-            loss, output = model(preprocess_sample(inputs, labels), torch.tensor(1.0).to("cuda"), one_hot_label.to("cuda"))
+            label_and_input, one_hot_labels = preprocess_sample(inputs, labels)
+            ff_labels = torch.ones(len(inputs), 1).to(device)
+            loss, output = model(label_and_input, ff_labels, one_hot_labels) # TODO (not sure if using model output -> neg data pipeline is a good idea anymore)
             loss.backward()
 
             optimizer.step()
@@ -156,16 +160,13 @@ def train(epochs, model, optimizer, train_loader): # this optimizer and loss is 
             # negative data forward
             # optimizer.zero_grad()
 
-            # making the output of the model 1 hot encoding
-            max_idx = torch.argmax(output)
-            output = torch.zeros_like(output)
-            output[max_idx] = 1
-
             # update accuracy calcs after positive data step
-            sample_counter += 1
-            epoch_accuracy += is_accurate(one_hot_label, output)
-
-            loss, output = model(preprocess_sample(inputs, max_idx + 1), torch.tensor(0.0).to("cuda"), output.detach().requires_grad_().to("cuda"))
+            sample_counter += len(inputs)
+            epoch_accuracy += absolute_loss(torch.argmax(one_hot_labels, -1), output)
+            label_and_input, one_hot_labels = preprocess_sample(inputs, output)
+            ff_labels = torch.zeros(len(inputs), 1).to(device)
+            breakpoint()
+            loss, output = model(label_and_input, ff_labels, one_hot_labels.detach().requires_grad_())
             # loss.backward() # TODO (should we do the linear regressor step for negative data?)
 
             # optimizer.step()
@@ -180,34 +181,25 @@ def train(epochs, model, optimizer, train_loader): # this optimizer and loss is 
             # sample_counter += 1
             # epoch_accuracy += is_accurate(label, output)
             if sample_counter % 1000 == 0:
-              print(f"Epoch: {epoch} -- Sample: {sample_counter}/{len(train_loader.dataset)} -- Accuracy rate: {epoch_accuracy}/{sample_counter}({round(epoch_accuracy/sample_counter*100, 2)}%)") # just doing this for positive samples for now
+                print(f"Epoch: {epoch} -- Sample: {sample_counter}/{len(train_loader.dataset)} -- Accuracy rate: {epoch_accuracy}/{sample_counter}({round(epoch_accuracy/sample_counter*100, 2)}%)") # just doing this for positive samples for now
         test(model)
     return model
-
-def preprocess_sample_test(inputs): 
-    # TODO (this will break when batch size is greater than 1)
-    one_hot_label = torch.zeros([10])
-    # concatinate the label as a 1 hot encoding and flattened image
-    return torch.cat((one_hot_label, torch.flatten(inputs))).to("cuda")
 
 def test(model):
     wrong = 0
     i = 0
     total = len(test_loader.dataset)
     for inputs, labels, in test_loader:
-        i += 1
-        truth = labels.item()
-        prediction = model.infer(preprocess_sample_test(inputs)).argmax() + 1
-        if truth != prediction:
-            #print_sample(inputs[0])
-            wrong += 1
+        i += len(inputs)
+        label_and_input, _ = preprocess_sample(inputs, torch.zeros(len(inputs), 10).to(device))
+        prediction = model.infer(label_and_input)
+        wrong += absolute_loss(labels, prediction)
     print(f"Error rate: {wrong} / {i} ({round(wrong/i*100, 2)}%)")
     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
-def is_accurate(label, output):
-    if torch.argmax(label) == torch.argmax(output):
-        return 1
-    return 0
+def absolute_loss(label, output):
+    return torch.count_nonzero(label - output, -1).item()
+
 
 # Define transformations for the dataset
 transform = transforms.Compose([
@@ -234,27 +226,27 @@ test_dataset = datasets.FashionMNIST(
 # Create DataLoader objects for batching and shuffling
 train_loader = torch.utils.data.DataLoader(
     dataset=train_dataset,
-    batch_size=1,  # Number of samples per batch
+    batch_size=128,  # Number of samples per batch
     shuffle=True  # Shuffle the dataset
 )
 
 test_loader = torch.utils.data.DataLoader(
     dataset=test_dataset,
-    batch_size=1,
+    batch_size=128,
     shuffle=False  # No need to shuffle the test set
 )
 
 # Example: Iterate through the training DataLoader
 for image, label in train_loader:
     image = image.squeeze(0)  # Remove the batch dimension, making it [1, 28, 28]
-    label = label.item()  # Convert the label tensor to a Python integer
-    print(f"Image shape: {image.shape}, Label: {label}")
+    #label = label.item()  # Convert the label tensor to a Python integer
+    print(f"Image shape: {image.shape}, Label: {label.shape}")
     break
 
 
 layers = [794, 2000, 2000, 2000, 2000]
 model = FwdFwdModel(layers)
-model = model.to("cuda")
+model = model.to(device)
 optimizer = torch.optim.Adam(model.get_linear_classifier_param())
 
 trained_model = train(30, model, optimizer, train_loader)
