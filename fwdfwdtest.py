@@ -29,7 +29,7 @@ class FwdFwdModel(torch.nn.Module):
         self.optimizers = []
         for i in range(len(layers) - 1):
             self.model.append(nn.Linear(layers[i], layers[i+1]))
-            self.optimizers.append(torch.optim.Adam(self.model[len(self.model) - 1].parameters()))
+            self.optimizers.append(torch.optim.Adam(self.model[len(self.model) - 1].parameters(), lr=0.01))
 
         self.ff_loss = nn.BCEWithLogitsLoss()
 
@@ -52,9 +52,9 @@ class FwdFwdModel(torch.nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.zeros_(m.weight)
 
-    def _calc_ff_loss(self, z, labels):
+    def _calc_ff_loss(self, z, labels, k=1):
         sum_of_squares = torch.sum(z ** 2, dim=-1)
-        logits = sum_of_squares - z.shape[-1] # TODO (not sure if authors used size of layer as threshold)
+        logits = sum_of_squares - z.shape[-1]*k
         logits = torch.reshape(torch.sigmoid(logits), (len(z), 1))
         ff_loss = self.ff_loss(logits, labels)
 
@@ -96,10 +96,10 @@ class FwdFwdModel(torch.nn.Module):
             z = layer(z)
             z = self.act_fn(z) # forward through layer
             neural_sample.append(z)
-            ff_loss, _ = self._calc_ff_loss(z, ff_labels) # calc layer wise loss
+            ff_loss, _ = self._calc_ff_loss(z, ff_labels, k=0.5) # calc layer wise loss
             self.optimizers[optim_idx].zero_grad()
 
-            ff_loss.backward(retain_graph=True) # compute gradients for layer
+            ff_loss.backward() # compute gradients for layer
 
             self.optimizers[optim_idx].step() # step forward
             optim_idx += 1
@@ -229,7 +229,7 @@ def test(model):
         label_and_input, _ = preprocess_sample(inputs, torch.zeros(len(inputs), 10).to(device))
         prediction = model.infer(label_and_input)
         #prediction = model.slower_inference(inputs)
-        wrong += absolute_loss(labels, prediction, True)
+        wrong += absolute_loss(labels, prediction)
 
     print(f"Error rate: {wrong} / {i} ({round(wrong/i*100, 2)}%)")
     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
@@ -292,7 +292,7 @@ test_loader = torch.utils.data.DataLoader(
 layers = [794, 2000, 2000, 2000, 2000] # TODO (mess with these values too)
 model = FwdFwdModel(layers)
 model = model.to(device)
-optimizer = torch.optim.Adam(model.get_linear_classifier_param(), lr=0.0001, weight_decay=0.001)
+optimizer = torch.optim.Adam(model.get_linear_classifier_param(), lr=0.0001)
 
 trained_model = train(30, model, optimizer, train_loader)
 
